@@ -1,6 +1,6 @@
 from demandSimulate import demandSimulate
 from globalVar import *
-from GPOneStepOptimizer import minimize,one_step_objective,finalCost
+from GPOneStepOptimizer import *
 
 
 import numpy as np
@@ -8,80 +8,115 @@ import GPy
 from multiprocess import Pool
 
 
+### Value is RBF Control is RBF
+## USE Derivative information
+def runner(include_finalcost = True):
+    if include_finalcost:
+        finalCost = finalCost1
+    else:
+        finalCost = finalCost2
+    
 
-def runner():
-
- #create X_{T-1} to X_T
-
-
-    # E[V(t+1) | X_t-1 = x_(t-1)]
+    # create (X_{T-1},I_T)
+    X_prev,I_next = create_samples()
+    # create conditional expectation models to save 
     global Model ; Model = [None] * (nstep)
     gpMdl = None
+    # create control models to save
     ctrl = None
     ctrlModel = [None] * (nstep)
+    # init warm-starters for emulators
     V_opt_start = None
     B_opt_start = None
+    # this computes E[V(X_T)|I_(T-1)], no regression 
     Model[nstep-1] = finalCost
 
-    for iStep in range(nstep,0,-1):
+    # assume we generated X_T-2,I_(T-1)
+    #X_prev,I_next = create_samples()
+    # create X_(T-2)->X_(T-1)
+    demandMatrix = demandSimulate(alpha, m0, sigma, 1, len(X_prev), dt, X_prev);
+   
+    # finding controls at T-1
+    optimal_B = np.zeros(len(X_prev))
 
-        if iStep!= nstep:
-            kernel  = GPy.kern.Matern52(ARD = True, input_dim=2)
-            X_train = np.column_stack((X_prev, I_next))
-            y_train = costNext
-            # E[V_t given X_t-1,I_t]
+    LB = np.maximum(B_min, (-I_next)/dt)
+    UB = np.minimum(B_max, (I_max-I_next)/dt)
+    sample_num = len(X_prev)
+    # not using derivative is better and no difference
+    args =[(one_step_objective,None,demandMatrix[i,1],I_next[i],finalCost,LB[i],UB[i]) for i in range(sample_num)]
+    #p = Pool()
+    #optimal_B = np.array(list(p.imap(minimize,args)))
+    #print(optimal_B)
 
-            gpMdl =  GPy.models.GPRegression(X_train,y_train.reshape(-1,1),kernel)
-            gpMdl.optimize(start = V_opt_start)
-            V_opt_start = gpMdl.param_array
-            print(iStep)
-            print(np.mean((y_train-gpMdl.predict(X_train)[0].flatten())**2))
-            print("\n")
-            Model[iStep-1] = gpMdl
-            # assuming we generated, X_t-2,I_t-1
-            # create path from X_t-2 to X_t-1, then. we optimize on X_t-1, I_t-1+ Bt dt with V_t to get V_t-1
-            demandMatrix = demandSimulate(alpha, m0, sigma, 1, len(X_prev), dt, X_prev);
-            optimal_B = np.zeros(len(X_prev))
-
-            ## Parallel Optimize B* as function of(Xt-1,I)
-            LB = np.maximum(B_min, (-I_next)/dt)
-            UB = np.minimum(B_max, (I_max-I_next)/dt)
-            sample_num = len(X_prev)
-            args =[(one_step_objective,demandMatrix[i,1],I_next[i],gpMdl,LB[i],UB[i]) for i in range(sample_num)]
-            #p = Pool()
-            #optimal_B = np.array(p.map(minimize,args))
-            idx = 0
-            for arg in args:
-                optimal_B[idx] = minimize(arg)
-                idx+=1
-
-            gp_test = np.column_stack((demandMatrix[:,1], I_next + optimal_B *dt))
-            costNext = np.abs((demandMatrix[:,1]+optimal_B)**2) *dt +gpMdl.predict(gp_test)[0].flatten()
-
-        else:
-
-            demandMatrix = demandSimulate(alpha, m0, sigma, 1, len(X_prev), dt, X_prev);
-            optimal_B = np.zeros(len(X_prev))
-
-            ## Parallel Optimize B* as function of(Xt-1,I)
-            LB = np.maximum(B_min, (-I_next)/dt)
-            UB = np.minimum(B_max, (I_max-I_next)/dt)
-            sample_num = len(X_prev)
-            args =[(one_step_objective,demandMatrix[i,1],I_next[i],finalCost,LB[i],UB[i]) for i in range(sample_num)]
-            #p = Pool()
-            #optimal_B = np.array(p.map(minimize,args))
-            idx = 0
-            for arg in args:
-                optimal_B[idx] = minimize(arg)
-                idx+=1
-
-            gp_test = np.column_stack((demandMatrix[:,1], I_next + optimal_B *dt))
-            costNext = np.abs((demandMatrix[:,1]+optimal_B)**2) *dt + finalCost(gp_test[:,1])
+    idx = 0
+    for arg in args:
+        optimal_B[idx] = minimize(arg)
+        idx+=1
+    # cost(T-1)|X(T-2) = (B(T-1)+X(T-1)**2)*dt + E[X_T|I_(T-1)]
+    gp_test = np.column_stack((demandMatrix[:,1], I_next + optimal_B *dt))
+    costNext = np.abs((demandMatrix[:,1]+optimal_B)**2) *dt + finalCost(gp_test[:,1])
 
 
+    # memorize controls
 
-        # memorize controls
-        kernel2 = GPy.kern.Matern32(ARD= True,input_dim=2)
+    # learn B(T-1) as function of (X(T-1),I(T-1))
+    kernel2 = GPy.kern.RBF(ARD= True,input_dim=2)
+    ctrl = GPy.models.GPRegression(np.column_stack((demandMatrix[:,1], I_next)), optimal_B.reshape(-1,1),kernel2)
+    ctrl.optimize(start = B_opt_start)
+    B_opt_start = ctrl.param_array
+    ctrlModel[nstep-1] = ctrl
+    
+    for iStep in range(nstep-1,0,-1):
+        # do regression to learn  cost(t)|X(t-1) as function of X(t-1) and I(t) where t = T-1,T-2,...,1
+        kernel1 = GPy.kern.RBF(input_dim =2, ARD = True)
+        X_train = np.column_stack((X_prev, I_next))
+        y_train = costNext
+
+        gpMdl =  GPy.models.GPRegression(X_train,y_train.reshape(-1,1),kernel1)
+        gpMdl.optimize(start = V_opt_start)
+        V_opt_start = gpMdl.param_array
+        Model[iStep-1] = gpMdl
+        ############################
+        #######Print MSE############
+        ############################
+        print(iStep)
+        print("Values:")
+        gpMSE = (y_train-gpMdl.predict(X_train)[0].flatten())**2
+        print(np.mean(gpMSE))
+        print(gpMdl.param_array)
+        print("Controls:")
+        gpMSE = (optimal_B-ctrl.predict(np.column_stack((demandMatrix[:,1], I_next)))[0].flatten())**2
+        print(np.mean(gpMSE))
+        print(ctrl.param_array)
+        print("\n")
+        
+        # assuming we generated, X_t-2,I_t-1 
+        #X_prev,I_next = create_samples()
+        # create path from X_t-2 to X_t-1,
+        demandMatrix = demandSimulate(alpha, m0, sigma, 1, len(X_prev), dt, X_prev);
+        # finding controls at t-1
+        optimal_B = np.zeros(len(X_prev))
+        LB = np.maximum(B_min, (-I_next)/dt)
+        UB = np.minimum(B_max, (I_max-I_next)/dt)
+        sample_num = len(X_prev)
+        args =[(one_step_objective,one_step_derivative,demandMatrix[i,1],I_next[i],gpMdl,LB[i],UB[i]) for i in range(sample_num)]
+        #p = Pool()
+        #optimal_B = np.array(list(p.imap(minimize,args)))
+        idx = 0
+        for arg in args:
+            optimal_B[idx] = minimize(arg)
+            idx+=1
+
+
+        gp_test = np.column_stack((demandMatrix[:,1], I_next + optimal_B *dt))
+
+        # learn cost(t-1)|x(t-2)
+        costNext = np.abs((demandMatrix[:,1]+optimal_B)**2) *dt +gpMdl.predict(gp_test)[0].flatten()
+
+        # use GP to learn control (t-1)
+
+        # set prior with previous model parameter as mean
+        kernel2 = GPy.kern.RBF(ARD= True,input_dim=2)
         ctrl = GPy.models.GPRegression(np.column_stack((demandMatrix[:,1], I_next)), optimal_B.reshape(-1,1),kernel2)
         ctrl.optimize(start = B_opt_start)
         B_opt_start = ctrl.param_array
@@ -110,7 +145,6 @@ def optimal_V(I0,X0,nsim,Model,steps):
     total_running_cost = np.sum(running_cost,axis = 1)
     total_cost = np.mean(total_running_cost+200 * np.maximum(5-Is[:,-1],0))
     return total_cost
-
 
 if __name__ == "__main__":
    Model = runner()
